@@ -1,0 +1,29 @@
+{
+  "name": "twilio-openai-bridge",
+  "version": "1.0.0",
+  "description": "Bridge for piping Twilio voice calls through OpenAI Realtime API",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "call": "node cli.js",
+    "dev": "nodemon bridge.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "twilio": "^4.19.3",
+    "sqlite3": "^5.1.6",
+    "soxr": "^1.0.0",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "bin": {
+    "call-senator": "./cli.js"
+  },
+  "keywords": ["twilio", "openai", "voice", "ai", "realtime"],
+  "author": "Your Name",
+  "license": "MIT"
+}
