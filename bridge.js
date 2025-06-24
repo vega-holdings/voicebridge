@@ -8,6 +8,7 @@ const crypto = require('crypto');
 
 // Audio processing
 const soxr = require('soxr'); // npm install soxr for resampling
+const mulaw = require('mulaw-pcm'); // npm install mulaw-pcm for μ-law conversion
 const { Readable, Transform } = require('stream');
 
 class TwilioOpenAIBridge {
@@ -16,6 +17,7 @@ class TwilioOpenAIBridge {
     this.app = express();
     this.db = new sqlite3.Database('./calls.db');
     this.activeSessions = new Map();
+    this.twilioConnections = new Map(); // callSid -> WebSocket
     this.twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
     
     this.setupDatabase();
@@ -158,6 +160,7 @@ class TwilioOpenAIBridge {
     };
 
     this.activeSessions.set(callSid, session);
+    this.twilioConnections.set(callSid, ws);
 
     // Connect to OpenAI Realtime
     await this.initOpenAISession(session);
@@ -178,6 +181,9 @@ class TwilioOpenAIBridge {
           case 'media':
             if (session.openaiWs && session.openaiWs.readyState === WebSocket.OPEN) {
               await this.processIncomingAudio(session, msg.media);
+            } else {
+              console.warn('OpenAI WebSocket not ready, attempting reconnection');
+              await this.initOpenAISession(session);
             }
             break;
 
@@ -191,23 +197,32 @@ class TwilioOpenAIBridge {
     });
 
     ws.on('close', () => {
+      this.twilioConnections.delete(callSid);
+      this.cleanup(session);
+    });
+
+    ws.on('error', (error) => {
+      console.error('Twilio WebSocket error:', error);
+      this.twilioConnections.delete(callSid);
       this.cleanup(session);
     });
   }
 
-  async initOpenAISession(session) {
-    const wsUrl = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
+  async initOpenAISession(session, retryCount = 0) {
+    const maxRetries = 3;
+    const wsUrl = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
     
-    session.openaiWs = new WebSocket(wsUrl, {
-      headers: {
-        'Authorization': `Bearer ${this.config.openai.apiKey}`,
-        'OpenAI-Beta': 'realtime=v1'
-      }
-    });
+    try {
+      session.openaiWs = new WebSocket(wsUrl, {
+        headers: {
+          'Authorization': `Bearer ${this.config.openai.apiKey}`,
+          'OpenAI-Beta': 'realtime=v1'
+        }
+      });
 
-    session.aiSessionId = crypto.randomUUID();
-    
-    session.openaiWs.on('open', () => {
+      session.aiSessionId = crypto.randomUUID();
+      
+      session.openaiWs.on('open', () => {
       // Configure session
       session.openaiWs.send(JSON.stringify({
         type: 'session.update',
@@ -236,15 +251,38 @@ class TwilioOpenAIBridge {
       this.handleOpenAIMessage(session, JSON.parse(data));
     });
 
-    session.openaiWs.on('error', (error) => {
+    session.openaiWs.on('error', async (error) => {
       console.error('OpenAI WebSocket error:', error);
-      this.reconnectOpenAI(session);
+      
+      if (retryCount < maxRetries) {
+        console.log(`Retrying OpenAI connection (${retryCount + 1}/${maxRetries})`);
+        await this.delay(1000 * Math.pow(2, retryCount)); // Exponential backoff
+        await this.initOpenAISession(session, retryCount + 1);
+      } else {
+        console.error('Max retries reached for OpenAI connection');
+        this.cleanup(session);
+      }
     });
 
-    // Auto-reconnect every 9 minutes to avoid 10-minute timeout
-    session.reconnectTimer = setTimeout(() => {
-      this.reconnectOpenAI(session);
-    }, 540000); // 9 minutes
+      // Auto-reconnect every 9 minutes to avoid 10-minute timeout
+      session.reconnectTimer = setTimeout(() => {
+        this.reconnectOpenAI(session);
+      }, 540000); // 9 minutes
+    } catch (error) {
+      console.error('Failed to initialize OpenAI session:', error);
+      if (retryCount < maxRetries) {
+        console.log(`Retrying OpenAI connection (${retryCount + 1}/${maxRetries})`);
+        await this.delay(1000 * Math.pow(2, retryCount));
+        await this.initOpenAISession(session, retryCount + 1);
+      } else {
+        console.error('Max retries reached for OpenAI connection');
+        this.cleanup(session);
+      }
+    }
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   async reconnectOpenAI(session) {
@@ -320,7 +358,7 @@ class TwilioOpenAIBridge {
       
       // Find active Twilio WebSocket connection
       const twilioWs = this.findTwilioConnection(session.callSid);
-      if (twilioWs) {
+      if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
         const mediaMessage = {
           event: 'media',
           streamSid: session.streamSid,
@@ -330,6 +368,8 @@ class TwilioOpenAIBridge {
         };
         
         twilioWs.send(JSON.stringify(mediaMessage));
+      } else {
+        console.warn('Twilio WebSocket not available or not ready');
       }
     } catch (error) {
       console.error('Error sending audio to Twilio:', error);
@@ -337,51 +377,67 @@ class TwilioOpenAIBridge {
   }
 
   async convertMuLawToPCM(muLawBuffer) {
-    // Convert 8kHz μ-law to 16kHz PCM using soxr
-    return new Promise((resolve, reject) => {
-      const resampler = soxr({
-        inputRate: 8000,
-        outputRate: 16000,
-        inputType: soxr.UINT8, // μ-law
-        outputType: soxr.INT16  // PCM
-      });
+    try {
+      // First convert μ-law to PCM (8kHz)
+      const pcm8khz = mulaw.decode(muLawBuffer);
+      
+      // Then resample from 8kHz to 16kHz
+      return new Promise((resolve, reject) => {
+        const resampler = soxr({
+          inputRate: 8000,
+          outputRate: 16000,
+          inputType: soxr.INT16,
+          outputType: soxr.INT16
+        });
 
-      let output = Buffer.alloc(0);
-      
-      resampler.on('data', (chunk) => {
-        output = Buffer.concat([output, chunk]);
+        let output = Buffer.alloc(0);
+        
+        resampler.on('data', (chunk) => {
+          output = Buffer.concat([output, chunk]);
+        });
+        
+        resampler.on('end', () => resolve(output));
+        resampler.on('error', reject);
+        
+        resampler.write(pcm8khz);
+        resampler.end();
       });
-      
-      resampler.on('end', () => resolve(output));
-      resampler.on('error', reject);
-      
-      resampler.write(muLawBuffer);
-      resampler.end();
-    });
+    } catch (error) {
+      console.error('μ-law to PCM conversion error:', error);
+      throw error;
+    }
   }
 
   async convertPCMToMuLaw(pcmBuffer) {
-    // Convert 16kHz PCM to 8kHz μ-law
-    return new Promise((resolve, reject) => {
-      const resampler = soxr({
-        inputRate: 16000,
-        outputRate: 8000,
-        inputType: soxr.INT16,  // PCM
-        outputType: soxr.UINT8  // μ-law
-      });
+    try {
+      // First resample from 16kHz to 8kHz
+      const pcm8khz = await new Promise((resolve, reject) => {
+        const resampler = soxr({
+          inputRate: 16000,
+          outputRate: 8000,
+          inputType: soxr.INT16,
+          outputType: soxr.INT16
+        });
 
-      let output = Buffer.alloc(0);
-      
-      resampler.on('data', (chunk) => {
-        output = Buffer.concat([output, chunk]);
+        let output = Buffer.alloc(0);
+        
+        resampler.on('data', (chunk) => {
+          output = Buffer.concat([output, chunk]);
+        });
+        
+        resampler.on('end', () => resolve(output));
+        resampler.on('error', reject);
+        
+        resampler.write(pcmBuffer);
+        resampler.end();
       });
       
-      resampler.on('end', () => resolve(output));
-      resampler.on('error', reject);
-      
-      resampler.write(pcmBuffer);
-      resampler.end();
-    });
+      // Then encode PCM to μ-law
+      return mulaw.encode(pcm8khz);
+    } catch (error) {
+      console.error('PCM to μ-law conversion error:', error);
+      throw error;
+    }
   }
 
   detectVoiceActivity(audioBuffer) {
@@ -415,13 +471,15 @@ class TwilioOpenAIBridge {
   }
 
   findTwilioConnection(callSid) {
-    // This would need to be implemented based on how you track WebSocket connections
-    // For now, returning null - you'd maintain a map of callSid -> WebSocket
+    const connection = this.twilioConnections.get(callSid);
+    if (connection && connection.readyState === WebSocket.OPEN) {
+      return connection;
+    }
     return null;
   }
 
   cleanup(session) {
-    if (session.openaiWs) {
+    if (session.openaiWs && session.openaiWs.readyState === WebSocket.OPEN) {
       session.openaiWs.close();
     }
     
@@ -429,6 +487,7 @@ class TwilioOpenAIBridge {
       clearTimeout(session.reconnectTimer);
     }
     
+    this.twilioConnections.delete(session.callSid);
     this.activeSessions.delete(session.callSid);
   }
 
