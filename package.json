@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node bridge.js",
     "call": "node cli.js",
-    "dev": "nodemon bridge.js"
+    "dev": "nodemon bridge.js",
+    "ui": "cd ui && npm run dev",
+    "ui:build": "cd ui && npm run build",
+    "ui:start": "cd ui && npm run start",
+    "setup": "npm install && cd ui && npm install"
   },
   "dependencies": {
     "express": "^4.18.2",
